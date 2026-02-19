@@ -11,13 +11,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from textual import on, work
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     Header, Footer, Static, Input, Label, ListView, ListItem,
-    Button, RichLog, SelectionList
+    Button, RichLog, SelectionList, DirectoryTree
 )
 from textual.widgets.selection_list import Selection
 from textual.screen import ModalScreen
@@ -26,21 +26,6 @@ from textual.events import Click
 from rich.text import Text
 import watchdog.observers
 import watchdog.events
-
-
-def _pick_directory_sync() -> Optional[str]:
-    """Open a native OS directory picker dialog (blocks until closed)."""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        chosen = filedialog.askdirectory(title="Select Log Directory")
-        root.destroy()
-        return chosen if chosen else None
-    except Exception:
-        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -184,6 +169,94 @@ class FileChangeHandler(watchdog.events.FileSystemEventHandler):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Directory Picker (Textual-native tree browser)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DirPickerModal(ModalScreen):
+    """Let the user visually browse and pick a directory using a tree view."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    CSS = """
+    DirPickerModal { align: center middle; }
+    #dp-dialog {
+        background: $surface;
+        border: thick $accent;
+        width: 72;
+        height: 30;
+        padding: 1 2;
+    }
+    #dp-title { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
+    #dp-nav-row { height: 3; align: left middle; margin-bottom: 1; }
+    #dp-path-input { width: 1fr; margin-right: 1; }
+    #dp-tree { height: 1fr; border: solid $surface-lighten-2; background: $background; margin-bottom: 1; }
+    #dp-selected { color: $text; height: 1; margin-bottom: 1; }
+    #dp-actions { height: 3; align: right middle; }
+    """
+
+    def __init__(self, on_pick, start_path: str = ""):
+        super().__init__()
+        self._on_pick = on_pick
+        self._start_path = os.path.expanduser(start_path or "~")
+        if not os.path.isdir(self._start_path):
+            self._start_path = os.path.expanduser("~")
+        self._chosen: str = self._start_path
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dp-dialog"):
+            yield Label("📂  Select Directory", id="dp-title")
+            with Horizontal(id="dp-nav-row"):
+                yield Input(
+                    value=self._start_path,
+                    placeholder="Type a path and press Enter to navigate...",
+                    id="dp-path-input",
+                )
+                yield Button("Go", variant="primary", id="dp-go")
+            yield DirectoryTree(self._start_path, id="dp-tree")
+            yield Label(f"[green]Selected:[/green] {self._start_path}", id="dp-selected")
+            with Horizontal(id="dp-actions"):
+                yield Button("Use This Directory", variant="success", id="dp-ok")
+                yield Button("Cancel", id="dp-cancel")
+
+    def on_mount(self):
+        self.query_one("#dp-tree", DirectoryTree).focus()
+
+    @on(DirectoryTree.DirectorySelected, "#dp-tree")
+    def on_dir_selected(self, event: DirectoryTree.DirectorySelected):
+        self._chosen = str(event.path)
+        self.query_one("#dp-selected", Label).update(
+            f"[green]Selected:[/green] {self._chosen}"
+        )
+
+    @on(Input.Submitted, "#dp-path-input")
+    @on(Button.Pressed, "#dp-go")
+    def on_navigate(self, event=None):
+        raw = self.query_one("#dp-path-input", Input).value.strip()
+        path = os.path.expanduser(raw)
+        if os.path.isdir(path):
+            tree = self.query_one("#dp-tree", DirectoryTree)
+            tree.path = path
+            tree.reload()
+            self._chosen = path
+            self.query_one("#dp-selected", Label).update(
+                f"[green]Selected:[/green] {self._chosen}"
+            )
+        else:
+            self.query_one("#dp-selected", Label).update(
+                f"[red]Not a directory:[/red] {path}"
+            )
+
+    @on(Button.Pressed, "#dp-ok")
+    def do_pick(self):
+        self._on_pick(self._chosen)
+        self.dismiss()
+
+    @on(Button.Pressed, "#dp-cancel")
+    def do_cancel(self):
+        self.dismiss()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Directory Browser Modal
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -290,18 +363,11 @@ class DirectoryBrowserModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-syspick")
     def on_syspick(self):
-        self._open_system_picker()
-
-    @work(thread=True)
-    def _open_system_picker(self):
-        chosen = _pick_directory_sync()
-        if chosen:
-            self.app.call_from_thread(self._apply_picked_dir, chosen)
-
-    def _apply_picked_dir(self, path: str):
-        inp = self.query_one("#dir-input", Input)
-        inp.value = path
-        self.do_scan()
+        current = self.query_one("#dir-input", Input).value.strip()
+        def on_pick(chosen: str):
+            self.query_one("#dir-input", Input).value = chosen
+            self.do_scan()
+        self.app.push_screen(DirPickerModal(on_pick=on_pick, start_path=current))
 
     # ── Slot buttons ────────────────────────────────────────────────────────
 
@@ -460,18 +526,11 @@ class SingleFileModal(ModalScreen):
 
     @on(Button.Pressed, "#sf-syspick")
     def on_syspick(self):
-        self._open_system_picker()
-
-    @work(thread=True)
-    def _open_system_picker(self):
-        chosen = _pick_directory_sync()
-        if chosen:
-            self.app.call_from_thread(self._apply_picked_dir, chosen)
-
-    def _apply_picked_dir(self, path: str):
-        inp = self.query_one("#sf-input", Input)
-        inp.value = path
-        self.do_scan()
+        current = self.query_one("#sf-input", Input).value.strip()
+        def on_pick(chosen: str):
+            self.query_one("#sf-input", Input).value = chosen
+            self.do_scan()
+        self.app.push_screen(DirPickerModal(on_pick=on_pick, start_path=current))
 
     @on(Button.Pressed, "#sf-scan")
     @on(Input.Submitted, "#sf-input")
@@ -807,12 +866,12 @@ class LogViperApp(App):
     #search-input { width: 36; margin: 0 1; }
     #search-status { width: 1fr; color: $text-muted; margin: 0 1; }
     .tb-btn { min-width: 10; height: 1; margin-right: 1; }
-    #btn-add-panel { min-width: 5; height: 1; margin-right: 0; background: green 30%; }
-    #btn-rm-panel  { min-width: 5; height: 1; margin-right: 1; background: red 30%; }
+    #btn-add-panel { min-width: 14; height: 1; margin-right: 0; }
+    #btn-rm-panel  { min-width: 14; height: 1; margin-right: 1; }
     #panel-count   { width: auto; color: $text-muted; margin-right: 1; }
 
     #panels-container { height: 1fr; }
-    #panels-row-1, #panels-row-2 { height: 1fr; }
+    #panels-container > Horizontal { height: 1fr; }
     """
 
     BINDINGS = [
@@ -857,17 +916,29 @@ class LogViperApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="toolbar"):
-            yield Button("📁 Open Directory [D]", variant="primary", id="btn-dir",    classes="tb-btn")
-            yield Button("📄 Open File [O]",      variant="default", id="btn-file",   classes="tb-btn")
+            btn_dir = Button("📁 Open Dir [D]", variant="primary", id="btn-dir", classes="tb-btn")
+            btn_dir.tooltip = "Browse a directory for log files (D)"
+            yield btn_dir
+            btn_file = Button("📄 Open File [O]", variant="default", id="btn-file", classes="tb-btn")
+            btn_file.tooltip = "Open a single file into the active panel (O)"
+            yield btn_file
             yield Label("│ ")
-            yield Button(" + ", variant="success", id="btn-add-panel")
-            yield Button(" - ", variant="error",   id="btn-rm-panel")
+            btn_add = Button("+ Add Panel", variant="success", id="btn-add-panel")
+            btn_add.tooltip = "Add a new panel (+/=)"
+            yield btn_add
+            btn_rm = Button("- Remove Panel", variant="error", id="btn-rm-panel")
+            btn_rm.tooltip = "Remove the last panel (-)"
+            yield btn_rm
             yield Label("1 panel", id="panel-count")
             yield Label("│ ")
             yield Input(placeholder="Search / highlight (regex supported)...", id="search-input")
             yield Label("", id="search-status")
-            yield Button("⚡ Sync [S]",     id="btn-sync",   classes="tb-btn")
-            yield Button("📌 Follow: ON",   id="btn-follow", classes="tb-btn", variant="success")
+            btn_sync = Button("⚡ Sync [S]", id="btn-sync", classes="tb-btn")
+            btn_sync.tooltip = "Sync all panels to the active panel's timestamp (S)"
+            yield btn_sync
+            btn_follow = Button("📌 Follow: ON", id="btn-follow", classes="tb-btn", variant="success")
+            btn_follow.tooltip = "Toggle auto-scroll to new log lines (F)"
+            yield btn_follow
         with Vertical(id="panels-container"):
             with Horizontal(id="panels-row-1"):
                 pass
