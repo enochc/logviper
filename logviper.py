@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -21,9 +21,26 @@ from textual.widgets import (
 )
 from textual.widgets.selection_list import Selection
 from textual.screen import ModalScreen
+from textual.message import Message
+from textual.events import Click
 from rich.text import Text
 import watchdog.observers
 import watchdog.events
+
+
+def _pick_directory_sync() -> Optional[str]:
+    """Open a native OS directory picker dialog (blocks until closed)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.askdirectory(title="Select Log Directory")
+        root.destroy()
+        return chosen if chosen else None
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -161,6 +178,9 @@ class FileChangeHandler(watchdog.events.FileSystemEventHandler):
     def on_modified(self, event):
         if not event.is_directory:
             self.callback(event.src_path)
+    def on_created(self, event):
+        if not event.is_directory:
+            self.callback(event.src_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -193,6 +213,7 @@ class DirectoryBrowserModal(ModalScreen):
     }
     #path-row { height: 3; align: left middle; }
     #dir-input { width: 1fr; margin-right: 1; }
+    #btn-syspick { min-width: 14; margin-right: 1; }
     #btn-browse { min-width: 10; }
     #filter-input { margin-top: 0; margin-bottom: 1; }
     #file-selection {
@@ -213,11 +234,12 @@ class DirectoryBrowserModal(ModalScreen):
     #btn-cancel { min-width: 10; margin-left: 1; }
     """
 
-    def __init__(self, on_open):
+    def __init__(self, on_open, default_dir: str = ""):
         super().__init__()
         self._on_open = on_open
         self._results: list = []
         self._start_panel = 0
+        self._default_dir = default_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="browser-dialog"):
@@ -227,7 +249,9 @@ class DirectoryBrowserModal(ModalScreen):
                 yield Input(
                     placeholder="Directory path  (e.g. /var/log  or  ~/myapp/logs  or  .)",
                     id="dir-input",
+                    value=self._default_dir,
                 )
+                yield Button("📂 Browse…", variant="warning", id="btn-syspick")
                 yield Button("Scan", variant="primary", id="btn-browse")
 
             yield Input(
@@ -256,7 +280,28 @@ class DirectoryBrowserModal(ModalScreen):
                 yield Button("Cancel",              id="btn-cancel")
 
     def on_mount(self):
-        self.query_one("#dir-input", Input).focus()
+        inp = self.query_one("#dir-input", Input)
+        inp.focus()
+        # Auto-scan if a default directory was provided
+        if self._default_dir:
+            self.do_scan()
+
+    # ── System directory picker ──────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-syspick")
+    def on_syspick(self):
+        self._open_system_picker()
+
+    @work(thread=True)
+    def _open_system_picker(self):
+        chosen = _pick_directory_sync()
+        if chosen:
+            self.app.call_from_thread(self._apply_picked_dir, chosen)
+
+    def _apply_picked_dir(self, path: str):
+        inp = self.query_one("#dir-input", Input)
+        inp.value = path
+        self.do_scan()
 
     # ── Slot buttons ────────────────────────────────────────────────────────
 
@@ -344,7 +389,8 @@ class DirectoryBrowserModal(ModalScreen):
                 "[yellow]Check at least one file, then click Open.[/yellow]"
             )
             return
-        self._on_open(chosen, self._start_panel)
+        base_path = getattr(self, '_base_path', '')
+        self._on_open(chosen, self._start_panel, base_path)
         self.dismiss()
 
     @on(Button.Pressed, "#btn-cancel")
@@ -373,22 +419,29 @@ class SingleFileModal(ModalScreen):
     #sf-title  { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
     #sf-row    { height: 3; align: left middle; }
     #sf-input  { width: 1fr; margin-right: 1; }
+    #sf-syspick { min-width: 14; margin-right: 1; }
     #sf-filter { margin-top: 0; margin-bottom: 1; }
     #sf-list   { height: 16; border: solid $surface-lighten-2; background: $background; margin-bottom: 1; }
     #sf-status { color: $text-muted; height: 1; margin-bottom: 1; }
     #sf-actions { height: 3; align: right middle; }
     """
 
-    def __init__(self, panel_idx: int, on_select):
+    def __init__(self, panel_idx: int, on_select, default_dir: str = ""):
         super().__init__()
         self._panel_idx = panel_idx
         self._on_select = on_select
+        self._default_dir = default_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="sf-dialog"):
             yield Label(f"📄  Open File → Panel {self._panel_idx + 1}", id="sf-title")
             with Horizontal(id="sf-row"):
-                yield Input(placeholder="Directory or full file path...", id="sf-input")
+                yield Input(
+                    placeholder="Directory or full file path...",
+                    id="sf-input",
+                    value=self._default_dir,
+                )
+                yield Button("📂 Browse…", variant="warning", id="sf-syspick")
                 yield Button("Scan", variant="primary", id="sf-scan")
             yield Input(placeholder="Filter by filename...", id="sf-filter")
             yield ListView(id="sf-list")
@@ -398,7 +451,27 @@ class SingleFileModal(ModalScreen):
                 yield Button("Cancel", id="sf-cancel")
 
     def on_mount(self):
-        self.query_one("#sf-input", Input).focus()
+        inp = self.query_one("#sf-input", Input)
+        inp.focus()
+        if self._default_dir:
+            self.do_scan()
+
+    # ── System directory picker ──────────────────────────────────────────────
+
+    @on(Button.Pressed, "#sf-syspick")
+    def on_syspick(self):
+        self._open_system_picker()
+
+    @work(thread=True)
+    def _open_system_picker(self):
+        chosen = _pick_directory_sync()
+        if chosen:
+            self.app.call_from_thread(self._apply_picked_dir, chosen)
+
+    def _apply_picked_dir(self, path: str):
+        inp = self.query_one("#sf-input", Input)
+        inp.value = path
+        self.do_scan()
 
     @on(Button.Pressed, "#sf-scan")
     @on(Input.Submitted, "#sf-input")
@@ -477,13 +550,15 @@ class HelpScreen(ModalScreen):
             yield Static("""[bold cyan]LogViper — Keyboard Reference[/bold cyan]
 
 [bold yellow]Opening Files[/bold yellow]
-  D         Open Directory Browser
+  D         Open Directory Browser (with system folder picker)
               → Scan a folder, check files, assign to panels
   O         Open single file into the focused panel
   Click ▶   Click the big button inside any empty panel
 
-[bold yellow]Panel Focus[/bold yellow]
-  1 / 2 / 3 / 4    Focus that panel (highlighted border)
+[bold yellow]Panels[/bold yellow]
+  +  / -           Add / remove panels (or use toolbar buttons)
+  1-8              Focus that panel (highlighted border)
+  Click panel      Click anywhere on a panel to make it active
 
 [bold yellow]Search & Highlight[/bold yellow]
   /         Jump to search box
@@ -497,6 +572,10 @@ class HelpScreen(ModalScreen):
   F    Toggle follow / tail mode
   ?    This help screen
   Q    Quit
+
+[bold yellow]Live Sync[/bold yellow]
+  Scrolling the active panel auto-syncs other panels
+  New rollover files (.1, .2, ...) are auto-detected
 
 [bold yellow]Search regex examples[/bold yellow]
   error|warn|fail      timeout.*503
@@ -545,15 +624,18 @@ class LogPanel(Vertical):
     .open-panel-btn { min-width: 32; }
     """
 
-    def __init__(self, panel_id: int, open_callback):
+    def __init__(self, panel_id: int, open_callback, scroll_callback=None):
         super().__init__()
         self.panel_id = panel_id
         self._open_callback = open_callback
+        self._scroll_callback = scroll_callback  # Called on scroll with (panel_id,)
         self.filepath: Optional[str] = None
         self.lines: list = []
         self.highlights: list = []
         self._follow = True
         self._lock = threading.Lock()
+        self._known_chain: list = []  # Rollover files we last loaded
+        self._syncing = False  # Guard against recursive sync
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -580,6 +662,16 @@ class LogPanel(Vertical):
         rl.display = False
         yield rl
 
+    def on_click(self, event: Click) -> None:
+        """Clicking anywhere on the panel makes it active."""
+        self.post_message(self.Activated(self.panel_id))
+
+    class Activated(Message):
+        """Posted when user clicks on a panel to activate it."""
+        def __init__(self, panel_id: int):
+            super().__init__()
+            self.panel_id = panel_id
+
     @on(Button.Pressed)
     def on_open_btn(self, event: Button.Pressed):
         if event.button.id == f"open-btn-{self.panel_id}":
@@ -588,20 +680,35 @@ class LogPanel(Vertical):
 
     def load_file(self, filepath: str):
         self.filepath = filepath
-        fname = os.path.basename(filepath)
-        chain = get_rollover_chain(filepath)
-        rolled = f" [dim](+{len(chain)-1} rolled)[/dim]" if len(chain) > 1 else ""
-
-        header = self.query_one(f"#ph-{self.panel_id}", Static)
-        header.update(
-            f"[bold]P{self.panel_id+1}[/bold] {fname}{rolled}  "
-            f"[dim]{os.path.dirname(filepath)}[/dim]"
-        )
-        header.add_class("has-file")
+        self._known_chain = get_rollover_chain(filepath)
+        self._update_header()
 
         self.query_one(f"#empty-{self.panel_id}").display = False
         self.query_one(f"#rl-{self.panel_id}", RichLog).display = True
         self.reload()
+
+    def _update_header(self):
+        if not self.filepath:
+            return
+        fname = os.path.basename(self.filepath)
+        chain = self._known_chain
+        rolled = f" [dim](+{len(chain)-1} rolled)[/dim]" if len(chain) > 1 else ""
+        header = self.query_one(f"#ph-{self.panel_id}", Static)
+        header.update(
+            f"[bold]P{self.panel_id+1}[/bold] {fname}{rolled}  "
+            f"[dim]{os.path.dirname(self.filepath)}[/dim]"
+        )
+        header.add_class("has-file")
+
+    def check_for_new_rollovers(self):
+        """Re-scan rollover chain; reload if new files appeared."""
+        if not self.filepath:
+            return
+        current_chain = get_rollover_chain(self.filepath)
+        if set(current_chain) != set(self._known_chain):
+            self._known_chain = current_chain
+            self._update_header()
+            self.reload()
 
     def reload(self, append_only: bool = False):
         if not self.filepath:
@@ -661,6 +768,23 @@ class LogPanel(Vertical):
         else:
             self.remove_class("active-panel")
 
+    def watch_scroll(self):
+        """Called by a timer from the app to check scroll changes."""
+        if not self.filepath or self._syncing:
+            return
+        rl = self.query_one(f"#rl-{self.panel_id}", RichLog)
+        cur_y = int(rl.scroll_y)
+        last_y = getattr(self, '_last_scroll_y', -1)
+        if cur_y == last_y:
+            return
+        self._last_scroll_y = cur_y
+        # Check for new rollover files when near the bottom
+        if cur_y + rl.size.height >= rl.virtual_size.height - 5:
+            self.check_for_new_rollovers()
+        # Notify app for live sync (only if this panel has focus)
+        if self._scroll_callback and self.has_class("active-panel"):
+            self._scroll_callback(self.panel_id)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main Application
@@ -683,6 +807,9 @@ class LogViperApp(App):
     #search-input { width: 36; margin: 0 1; }
     #search-status { width: 1fr; color: $text-muted; margin: 0 1; }
     .tb-btn { min-width: 10; height: 1; margin-right: 1; }
+    #btn-add-panel { min-width: 5; height: 1; margin-right: 0; background: green 30%; }
+    #btn-rm-panel  { min-width: 5; height: 1; margin-right: 1; background: red 30%; }
+    #panel-count   { width: auto; color: $text-muted; margin-right: 1; }
 
     #panels-container { height: 1fr; }
     #panels-row-1, #panels-row-2 { height: 1fr; }
@@ -699,10 +826,16 @@ class LogViperApp(App):
         Binding("escape",   "clear_search",   "Clear"),
         Binding("?",        "show_help",      "Help"),
         Binding("q",        "quit",           "Quit"),
+        Binding("plus,equal", "add_panel",    "+ Panel", show=False),
+        Binding("minus",      "remove_panel", "- Panel", show=False),
         Binding("1", "focus_panel_0", show=False),
         Binding("2", "focus_panel_1", show=False),
         Binding("3", "focus_panel_2", show=False),
         Binding("4", "focus_panel_3", show=False),
+        Binding("5", "focus_panel_4", show=False),
+        Binding("6", "focus_panel_5", show=False),
+        Binding("7", "focus_panel_6", show=False),
+        Binding("8", "focus_panel_7", show=False),
     ]
 
     def __init__(self, files: list = None):
@@ -717,12 +850,19 @@ class LogViperApp(App):
         self._watcher = watchdog.observers.Observer()
         self._watcher.start()
         self._watched_dirs: set = set()
+        self._root_dir: str = ""  # Remembered directory for new panels
+        self._live_sync = True     # Live sync other panels on scroll
+        self._scroll_timer = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="toolbar"):
             yield Button("📁 Open Directory [D]", variant="primary", id="btn-dir",    classes="tb-btn")
             yield Button("📄 Open File [O]",      variant="default", id="btn-file",   classes="tb-btn")
+            yield Label("│ ")
+            yield Button(" + ", variant="success", id="btn-add-panel")
+            yield Button(" - ", variant="error",   id="btn-rm-panel")
+            yield Label("1 panel", id="panel-count")
             yield Label("│ ")
             yield Input(placeholder="Search / highlight (regex supported)...", id="search-input")
             yield Label("", id="search-status")
@@ -734,33 +874,108 @@ class LogViperApp(App):
         yield Footer()
 
     def on_mount(self):
-        # Always create all 4 panels upfront so the layout is obvious
-        for _ in range(4):
+        # Start with 1 panel; user adds more with + button
+        n = max(1, len(self._initial_files))
+        for _ in range(n):
             self._add_panel()
 
-        for i, f in enumerate(self._initial_files[:4]):
+        for i, f in enumerate(self._initial_files[:len(self._panels)]):
             if os.path.exists(f):
                 self._panels[i].load_file(f)
                 self._watch_file(f)
 
         self._set_active(0)
+        self._update_panel_count()
+        # Poll scroll positions for live sync + rollover detection
+        self._scroll_timer = self.set_interval(0.25, self._poll_scroll)
 
     # ── Panel layout ────────────────────────────────────────────────────────
 
+    MAX_PANELS = 8
+
+    def _row_for_panel(self, panel_index: int) -> Horizontal:
+        """Get (or create) the row container for a panel at the given index."""
+        row_num = panel_index // 2  # 2 panels per row
+        row_id = f"panels-row-{row_num + 1}"
+        try:
+            return self.query_one(f"#{row_id}", Horizontal)
+        except Exception:
+            row = Horizontal(id=row_id)
+            self.query_one("#panels-container", Vertical).mount(row)
+            return row
+
     def _add_panel(self):
-        if len(self._panels) >= 4:
+        if len(self._panels) >= self.MAX_PANELS:
             return
-        panel = LogPanel(len(self._panels), open_callback=self._panel_open_callback)
+        panel = LogPanel(
+            len(self._panels),
+            open_callback=self._panel_open_callback,
+            scroll_callback=self._on_panel_scrolled,
+        )
         self._panels.append(panel)
-        if len(self._panels) <= 2:
-            self.query_one("#panels-row-1", Horizontal).mount(panel)
-        else:
+        row = self._row_for_panel(len(self._panels) - 1)
+        row.mount(panel)
+        self._update_panel_count()
+
+    def _remove_panel(self):
+        if len(self._panels) <= 1:
+            return
+        panel = self._panels.pop()
+        panel.remove()
+        # Remove empty row containers
+        row_num = len(self._panels) // 2
+        row_id = f"panels-row-{row_num + 1}"
+        # If the row is empty (both panels from that row removed) and it's not the first row
+        if len(self._panels) % 2 == 0 and row_num > 0:
             try:
-                row2 = self.query_one("#panels-row-2", Horizontal)
+                row = self.query_one(f"#{row_id}", Horizontal)
+                if len(row.children) == 0:
+                    row.remove()
             except Exception:
-                row2 = Horizontal(id="panels-row-2")
-                self.query_one("#panels-container", Vertical).mount(row2)
-            row2.mount(panel)
+                pass
+        if self._active_panel >= len(self._panels):
+            self._set_active(len(self._panels) - 1)
+        self._update_panel_count()
+
+    def _update_panel_count(self):
+        n = len(self._panels)
+        try:
+            self.query_one("#panel-count", Label).update(
+                f"{n} panel{'s' if n != 1 else ''}"
+            )
+        except Exception:
+            pass
+
+    def _poll_scroll(self):
+        """Periodic timer: check each panel for scroll changes."""
+        for panel in self._panels:
+            if panel.filepath:
+                try:
+                    panel.watch_scroll()
+                except Exception:
+                    pass
+
+    def _on_panel_scrolled(self, panel_id: int):
+        """Live sync: when the active panel scrolls, sync others to same timestamp."""
+        if not self._live_sync:
+            return
+        if panel_id != self._active_panel:
+            return
+        ap = self._panels[panel_id]
+        ts = ap.get_current_timestamp()
+        if ts is None:
+            return
+        for i, panel in enumerate(self._panels):
+            if i != panel_id and panel.filepath:
+                panel._syncing = True
+                try:
+                    panel.scroll_to_timestamp(ts)
+                finally:
+                    panel._syncing = False
+
+    @on(LogPanel.Activated)
+    def on_panel_activated(self, event: LogPanel.Activated):
+        self._set_active(event.panel_id)
 
     def _panel_open_callback(self, panel_idx: int):
         self._set_active(panel_idx)
@@ -793,6 +1008,10 @@ class LogViperApp(App):
                 chain = get_rollover_chain(panel.filepath)
                 if changed_path in chain or changed_path == panel.filepath:
                     self.call_from_thread(panel.reload, True)
+                # Detect new rollover files appearing in same directory
+                elif os.path.dirname(os.path.abspath(changed_path)) == \
+                     os.path.dirname(os.path.abspath(panel.filepath)):
+                    self.call_from_thread(panel.check_for_new_rollovers)
 
     # ── Toolbar buttons ──────────────────────────────────────────────────────
 
@@ -808,31 +1027,60 @@ class LogViperApp(App):
     @on(Button.Pressed, "#btn-follow")
     def on_btn_follow(self): self.action_toggle_follow()
 
+    @on(Button.Pressed, "#btn-add-panel")
+    def on_btn_add(self):   self.action_add_panel()
+
+    @on(Button.Pressed, "#btn-rm-panel")
+    def on_btn_rm(self):    self.action_remove_panel()
+
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def action_open_directory(self):
-        def on_open(files: list, start_panel: int):
-            for offset, filepath in enumerate(files[:4]):
-                slot = (start_panel + offset) % 4
+        def on_open(files: list, start_panel: int, base_path: str = ""):
+            if base_path:
+                self._root_dir = base_path
+            for offset, filepath in enumerate(files):
+                slot = (start_panel + offset) % len(self._panels)
                 self._panels[slot].load_file(filepath)
                 self._watch_file(filepath)
                 if self._highlights:
                     self._panels[slot].apply_highlights(self._highlights)
-        self.push_screen(DirectoryBrowserModal(on_open=on_open))
+        self.push_screen(DirectoryBrowserModal(
+            on_open=on_open, default_dir=self._root_dir,
+        ))
 
     def action_open_file(self):
         panel_idx = self._active_panel
         def on_select(filepath: str):
-            self._panels[panel_idx].load_file(filepath)
-            self._watch_file(filepath)
-            if self._highlights:
-                self._panels[panel_idx].apply_highlights(self._highlights)
-        self.push_screen(SingleFileModal(panel_idx, on_select))
+            if panel_idx < len(self._panels):
+                self._panels[panel_idx].load_file(filepath)
+                self._watch_file(filepath)
+                if self._highlights:
+                    self._panels[panel_idx].apply_highlights(self._highlights)
+        self.push_screen(SingleFileModal(
+            panel_idx, on_select, default_dir=self._root_dir,
+        ))
+
+    def action_add_panel(self):
+        self._add_panel()
+
+    def action_remove_panel(self):
+        self._remove_panel()
 
     def action_focus_panel_0(self): self._set_active(0)
     def action_focus_panel_1(self): self._set_active(1)
-    def action_focus_panel_2(self): self._set_active(2)
-    def action_focus_panel_3(self): self._set_active(3)
+    def action_focus_panel_2(self):
+        if len(self._panels) > 2: self._set_active(2)
+    def action_focus_panel_3(self):
+        if len(self._panels) > 3: self._set_active(3)
+    def action_focus_panel_4(self):
+        if len(self._panels) > 4: self._set_active(4)
+    def action_focus_panel_5(self):
+        if len(self._panels) > 5: self._set_active(5)
+    def action_focus_panel_6(self):
+        if len(self._panels) > 6: self._set_active(6)
+    def action_focus_panel_7(self):
+        if len(self._panels) > 7: self._set_active(7)
 
     def action_focus_search(self):
         self.query_one("#search-input", Input).focus()
@@ -930,6 +1178,8 @@ class LogViperApp(App):
         self.push_screen(HelpScreen())
 
     def on_unmount(self):
+        if self._scroll_timer:
+            self._scroll_timer.stop()
         self._watcher.stop()
         self._watcher.join()
 
