@@ -17,7 +17,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     Header, Footer, Static, Input, Label, ListView, ListItem,
-    Button, RichLog, SelectionList, DirectoryTree
+    Button, RichLog, SelectionList
 )
 from textual.widgets.selection_list import Selection
 from textual.screen import ModalScreen
@@ -169,94 +169,6 @@ class FileChangeHandler(watchdog.events.FileSystemEventHandler):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Directory Picker (Textual-native tree browser)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class DirPickerModal(ModalScreen):
-    """Let the user visually browse and pick a directory using a tree view."""
-
-    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
-
-    CSS = """
-    DirPickerModal { align: center middle; }
-    #dp-dialog {
-        background: $surface;
-        border: thick $accent;
-        width: 72;
-        height: 30;
-        padding: 1 2;
-    }
-    #dp-title { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
-    #dp-nav-row { height: 3; align: left middle; margin-bottom: 1; }
-    #dp-path-input { width: 1fr; margin-right: 1; }
-    #dp-tree { height: 1fr; border: solid $surface-lighten-2; background: $background; margin-bottom: 1; }
-    #dp-selected { color: $text; height: 1; margin-bottom: 1; }
-    #dp-actions { height: 3; align: right middle; }
-    """
-
-    def __init__(self, on_pick, start_path: str = ""):
-        super().__init__()
-        self._on_pick = on_pick
-        self._start_path = os.path.expanduser(start_path or "~")
-        if not os.path.isdir(self._start_path):
-            self._start_path = os.path.expanduser("~")
-        self._chosen: str = self._start_path
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="dp-dialog"):
-            yield Label("📂  Select Directory", id="dp-title")
-            with Horizontal(id="dp-nav-row"):
-                yield Input(
-                    value=self._start_path,
-                    placeholder="Type a path and press Enter to navigate...",
-                    id="dp-path-input",
-                )
-                yield Button("Go", variant="primary", id="dp-go")
-            yield DirectoryTree(self._start_path, id="dp-tree")
-            yield Label(f"[green]Selected:[/green] {self._start_path}", id="dp-selected")
-            with Horizontal(id="dp-actions"):
-                yield Button("Use This Directory", variant="success", id="dp-ok")
-                yield Button("Cancel", id="dp-cancel")
-
-    def on_mount(self):
-        self.query_one("#dp-tree", DirectoryTree).focus()
-
-    @on(DirectoryTree.DirectorySelected, "#dp-tree")
-    def on_dir_selected(self, event: DirectoryTree.DirectorySelected):
-        self._chosen = str(event.path)
-        self.query_one("#dp-selected", Label).update(
-            f"[green]Selected:[/green] {self._chosen}"
-        )
-
-    @on(Input.Submitted, "#dp-path-input")
-    @on(Button.Pressed, "#dp-go")
-    def on_navigate(self, event=None):
-        raw = self.query_one("#dp-path-input", Input).value.strip()
-        path = os.path.expanduser(raw)
-        if os.path.isdir(path):
-            tree = self.query_one("#dp-tree", DirectoryTree)
-            tree.path = path
-            tree.reload()
-            self._chosen = path
-            self.query_one("#dp-selected", Label).update(
-                f"[green]Selected:[/green] {self._chosen}"
-            )
-        else:
-            self.query_one("#dp-selected", Label).update(
-                f"[red]Not a directory:[/red] {path}"
-            )
-
-    @on(Button.Pressed, "#dp-ok")
-    def do_pick(self):
-        self._on_pick(self._chosen)
-        self.dismiss()
-
-    @on(Button.Pressed, "#dp-cancel")
-    def do_cancel(self):
-        self.dismiss()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Directory Browser Modal
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -286,7 +198,6 @@ class DirectoryBrowserModal(ModalScreen):
     }
     #path-row { height: 3; align: left middle; }
     #dir-input { width: 1fr; margin-right: 1; }
-    #btn-syspick { min-width: 14; margin-right: 1; }
     #btn-browse { min-width: 10; }
     #filter-input { margin-top: 0; margin-bottom: 1; }
     #file-selection {
@@ -324,7 +235,6 @@ class DirectoryBrowserModal(ModalScreen):
                     id="dir-input",
                     value=self._default_dir,
                 )
-                yield Button("📂 Browse…", variant="warning", id="btn-syspick")
                 yield Button("Scan", variant="primary", id="btn-browse")
 
             yield Input(
@@ -358,16 +268,6 @@ class DirectoryBrowserModal(ModalScreen):
         # Auto-scan if a default directory was provided
         if self._default_dir:
             self.do_scan()
-
-    # ── System directory picker ──────────────────────────────────────────────
-
-    @on(Button.Pressed, "#btn-syspick")
-    def on_syspick(self):
-        current = self.query_one("#dir-input", Input).value.strip()
-        def on_pick(chosen: str):
-            self.query_one("#dir-input", Input).value = chosen
-            self.do_scan()
-        self.app.push_screen(DirPickerModal(on_pick=on_pick, start_path=current))
 
     # ── Slot buttons ────────────────────────────────────────────────────────
 
@@ -485,7 +385,6 @@ class SingleFileModal(ModalScreen):
     #sf-title  { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
     #sf-row    { height: 3; align: left middle; }
     #sf-input  { width: 1fr; margin-right: 1; }
-    #sf-syspick { min-width: 14; margin-right: 1; }
     #sf-filter { margin-top: 0; margin-bottom: 1; }
     #sf-list   { height: 16; border: solid $surface-lighten-2; background: $background; margin-bottom: 1; }
     #sf-status { color: $text-muted; height: 1; margin-bottom: 1; }
@@ -507,7 +406,6 @@ class SingleFileModal(ModalScreen):
                     id="sf-input",
                     value=self._default_dir,
                 )
-                yield Button("📂 Browse…", variant="warning", id="sf-syspick")
                 yield Button("Scan", variant="primary", id="sf-scan")
             yield Input(placeholder="Filter by filename...", id="sf-filter")
             yield ListView(id="sf-list")
@@ -521,16 +419,6 @@ class SingleFileModal(ModalScreen):
         inp.focus()
         if self._default_dir:
             self.do_scan()
-
-    # ── System directory picker ──────────────────────────────────────────────
-
-    @on(Button.Pressed, "#sf-syspick")
-    def on_syspick(self):
-        current = self.query_one("#sf-input", Input).value.strip()
-        def on_pick(chosen: str):
-            self.query_one("#sf-input", Input).value = chosen
-            self.do_scan()
-        self.app.push_screen(DirPickerModal(on_pick=on_pick, start_path=current))
 
     @on(Button.Pressed, "#sf-scan")
     @on(Input.Submitted, "#sf-input")
@@ -674,6 +562,8 @@ class LogPanel(Vertical):
     LogPanel > RichLog {
         height: 1fr;
         scrollbar-size: 1 1;
+        overflow-x: auto;
+        overflow-y: auto;
     }
     .empty-prompt {
         height: 1fr;
@@ -797,16 +687,39 @@ class LogPanel(Vertical):
     def scroll_to_line(self, line_index: int):
         self.query_one(f"#rl-{self.panel_id}", RichLog).scroll_to(y=line_index, animate=False)
 
-    def scroll_to_timestamp(self, ts: float, tolerance: float = 2.0):
+    def scroll_to_timestamp(self, ts: float):
+        """Binary-search for the line whose timestamp is closest to *ts*."""
+        lines = self.lines
+        if not lines:
+            return
+
+        def _ts_near(idx: int):
+            """Return (timestamp, actual_line_index) for the nearest
+            timestamped line around *idx*, searching outward up to 50 rows."""
+            for offset in range(min(50, len(lines))):
+                for candidate in (idx + offset, idx - offset):
+                    if 0 <= candidate < len(lines):
+                        lt = extract_timestamp(lines[candidate])
+                        if lt is not None:
+                            return lt, candidate
+            return None, idx
+
+        lo, hi = 0, len(lines) - 1
         best_idx, best_diff = 0, float('inf')
-        for i, line in enumerate(self.lines):
-            lt = extract_timestamp(line)
-            if lt is not None:
-                diff = abs(lt - ts)
-                if diff < best_diff:
-                    best_diff, best_idx = diff, i
-                    if diff < tolerance:
-                        break
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            lt, actual = _ts_near(mid)
+            if lt is None:
+                break
+            diff = abs(lt - ts)
+            if diff < best_diff:
+                best_diff, best_idx = diff, actual
+            if lt < ts:
+                lo = mid + 1
+            elif lt > ts:
+                hi = mid - 1
+            else:
+                break
         self.scroll_to_line(best_idx)
 
     def search_lines(self, pattern) -> list:
@@ -815,7 +728,13 @@ class LogPanel(Vertical):
     def get_current_timestamp(self) -> Optional[float]:
         rl = self.query_one(f"#rl-{self.panel_id}", RichLog)
         scroll_y = int(rl.scroll_y)
-        for line in self.lines[scroll_y: scroll_y + 20]:
+        # Search forward from the current scroll position first.
+        for line in self.lines[scroll_y: scroll_y + 40]:
+            ts = extract_timestamp(line)
+            if ts:
+                return ts
+        # Fall back to searching backward if nothing found ahead.
+        for line in reversed(self.lines[max(0, scroll_y - 30): scroll_y]):
             ts = extract_timestamp(line)
             if ts:
                 return ts
@@ -858,16 +777,16 @@ class LogViperApp(App):
     Screen { background: $background; }
 
     #toolbar {
-        height: 3;
+        height: 5;
         background: $surface;
         padding: 0 1;
         align: left middle;
     }
     #search-input { width: 36; margin: 0 1; }
     #search-status { width: 1fr; color: $text-muted; margin: 0 1; }
-    .tb-btn { min-width: 10; height: 1; margin-right: 1; }
-    #btn-add-panel { min-width: 14; height: 1; margin-right: 0; }
-    #btn-rm-panel  { min-width: 14; height: 1; margin-right: 1; }
+    .tb-btn { min-width: 10; height: 3; margin-right: 1; }
+    #btn-add-panel  { min-width: 14; height: 3; margin-right: 0; }
+    #btn-rm-panel   { min-width: 14; height: 3; margin-right: 1; }
     #panel-count   { width: auto; color: $text-muted; margin-right: 1; }
 
     #panels-container { height: 1fr; }
@@ -991,17 +910,20 @@ class LogViperApp(App):
     def _remove_panel(self):
         if len(self._panels) <= 1:
             return
+        # Capture the index before popping so we can work out which row it lived in.
+        removed_idx = len(self._panels) - 1
         panel = self._panels.pop()
         panel.remove()
-        # Remove empty row containers
-        row_num = len(self._panels) // 2
-        row_id = f"panels-row-{row_num + 1}"
-        # If the row is empty (both panels from that row removed) and it's not the first row
-        if len(self._panels) % 2 == 0 and row_num > 0:
+        # If the removed panel was the *only* occupant of its row (i.e. it sat at
+        # an even index — the first slot in a 2-per-row layout) and it wasn't in
+        # the very first row, remove that now-empty row container.
+        # We do this by index arithmetic rather than checking row.children because
+        # Textual removes widgets asynchronously so children is still non-empty.
+        row_num = removed_idx // 2       # 0-based row index the panel lived in
+        was_alone = (removed_idx % 2 == 0)  # True → panel was first (and only) in row
+        if was_alone and row_num > 0:
             try:
-                row = self.query_one(f"#{row_id}", Horizontal)
-                if len(row.children) == 0:
-                    row.remove()
+                self.query_one(f"#panels-row-{row_num + 1}", Horizontal).remove()
             except Exception:
                 pass
         if self._active_panel >= len(self._panels):
