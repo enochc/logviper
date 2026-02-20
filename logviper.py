@@ -5,7 +5,9 @@ LogViper - Cross-platform multi-file synchronized log viewer
 
 import re
 import os
+import sys
 import glob
+import subprocess
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -79,6 +81,26 @@ LEVEL_PATTERNS = [
 ]
 TS_COLOR_RE = re.compile(r'\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}|\b\d{2}:\d{2}:\d{2}')
 
+# Maps every log-level keyword → the filter-button ID used in LogPanel
+_LEVEL_TO_FID: dict[str, str] = {
+    'VERBOSE': 'v', 'TRACE': 'v',
+    'DEBUG': 'd', 'DBG': 'd',
+    'INFO': 'i',
+    'WARN': 'w', 'WARNING': 'w',
+    'ERROR': 'e', 'ERR': 'e', 'FATAL': 'e', 'CRITICAL': 'e',
+}
+# Ordered list of (filter-id, button-label) for composing the header row
+_FILTER_BUTTONS = [('v', 'VERB'), ('d', 'DBG'), ('i', 'INFO'), ('w', 'WARN'), ('e', 'ERR')]
+
+
+def _line_fid(line: str) -> Optional[str]:
+    """Return the filter-button ID for the dominant log level in *line*, or None."""
+    for pat, _ in LEVEL_PATTERNS:
+        m = pat.search(line)
+        if m:
+            return _LEVEL_TO_FID.get(m.group(0).upper())
+    return None
+
 def colorize_line(line: str, highlights: list) -> Text:
     text = Text(line, no_wrap=True, overflow="ellipsis")
     for pattern, style in LEVEL_PATTERNS:
@@ -151,6 +173,64 @@ def find_log_files(directory: str, max_results: int = 500) -> list:
     except PermissionError:
         pass
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Native OS file / directory pickers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pick_directory_native() -> Optional[str]:
+    """Open the OS-native directory picker (blocking).  Returns chosen path or None."""
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(
+                ["osascript", "-e", "POSIX path of (choose folder)"],
+                capture_output=True, text=True, timeout=300,
+            )
+            p = r.stdout.strip().rstrip("/")
+            return p if r.returncode == 0 and p else None
+        # Linux: try zenity (GNOME) then kdialog (KDE)
+        for cmd in (
+            ["zenity", "--file-selection", "--directory", "--title=Select Directory"],
+            ["kdialog", "--getexistingdirectory", os.path.expanduser("~")],
+        ):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                p = r.stdout.strip()
+                if r.returncode == 0 and p:
+                    return p
+            except FileNotFoundError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _pick_file_native() -> Optional[str]:
+    """Open the OS-native file picker (blocking).  Returns chosen path or None."""
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(
+                ["osascript", "-e",
+                 'POSIX path of (choose file with prompt "Select a log file")'],
+                capture_output=True, text=True, timeout=300,
+            )
+            p = r.stdout.strip()
+            return p if r.returncode == 0 and p else None
+        for cmd in (
+            ["zenity", "--file-selection", "--title=Select File"],
+            ["kdialog", "--getopenfilename", os.path.expanduser("~")],
+        ):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                p = r.stdout.strip()
+                if r.returncode == 0 and p:
+                    return p
+            except FileNotFoundError:
+                continue
+    except Exception:
+        pass
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -551,13 +631,24 @@ class LogPanel(Vertical):
     }
     LogPanel > .panel-header {
         background: $surface-lighten-1;
-        height: 1;
+        height: 3;
         padding: 0 1;
         color: $text-muted;
+        align: left middle;
     }
     LogPanel > .panel-header.has-file {
         background: $primary-darken-2;
         color: $text;
+    }
+    .ph-label {
+        width: 1fr;
+        height: 1;
+        content-align: left middle;
+    }
+    .level-btn {
+        min-width: 6;
+        height: 3;
+        margin: 0 0 0 1;
     }
     LogPanel > RichLog {
         height: 1fr;
@@ -585,13 +676,19 @@ class LogPanel(Vertical):
         self._lock = threading.Lock()
         self._known_chain: list = []  # Rollover files we last loaded
         self._syncing = False  # Guard against recursive sync
+        self._level_filter: set[str] = {'v', 'd', 'i', 'w', 'e'}  # all on
+        self._line_fids: list[Optional[str]] = []  # pre-computed level fid per line
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            f"[dim]Panel {self.panel_id + 1} — empty[/dim]",
-            classes="panel-header",
-            id=f"ph-{self.panel_id}",
-        )
+        with Horizontal(classes="panel-header", id=f"ph-{self.panel_id}"):
+            yield Static(
+                f"[dim]Panel {self.panel_id + 1} — empty[/dim]",
+                classes="ph-label",
+                id=f"ph-label-{self.panel_id}",
+            )
+            for fid, label in _FILTER_BUTTONS:
+                yield Button(label, id=f"lf-{self.panel_id}-{fid}",
+                             classes="level-btn", variant="primary")
         yield Vertical(
             Label(f"[dim]Panel {self.panel_id + 1}[/dim]\n"),
             Button(
@@ -622,10 +719,23 @@ class LogPanel(Vertical):
             self.panel_id = panel_id
 
     @on(Button.Pressed)
-    def on_open_btn(self, event: Button.Pressed):
-        if event.button.id == f"open-btn-{self.panel_id}":
+    def on_btn_pressed(self, event: Button.Pressed):
+        bid = event.button.id or ""
+        if bid == f"open-btn-{self.panel_id}":
             event.stop()
             self._open_callback(self.panel_id)
+        elif bid.startswith(f"lf-{self.panel_id}-"):
+            event.stop()
+            toggle_fid = bid.rsplit("-", 1)[-1]
+            btn = event.button
+            if toggle_fid in self._level_filter:
+                self._level_filter.discard(toggle_fid)
+                btn.variant = "default"
+            else:
+                self._level_filter.add(toggle_fid)
+                btn.variant = "primary"
+            # Re-render from the already-cached lines — no disk read, no extra regex.
+            self._rerender()
 
     def load_file(self, filepath: str):
         self.filepath = filepath
@@ -642,12 +752,11 @@ class LogPanel(Vertical):
         fname = os.path.basename(self.filepath)
         chain = self._known_chain
         rolled = f" [dim](+{len(chain)-1} rolled)[/dim]" if len(chain) > 1 else ""
-        header = self.query_one(f"#ph-{self.panel_id}", Static)
-        header.update(
+        self.query_one(f"#ph-label-{self.panel_id}", Static).update(
             f"[bold]P{self.panel_id+1}[/bold] {fname}{rolled}  "
             f"[dim]{os.path.dirname(self.filepath)}[/dim]"
         )
-        header.add_class("has-file")
+        self.query_one(f"#ph-{self.panel_id}").add_class("has-file")
 
     def check_for_new_rollovers(self):
         """Re-scan rollover chain; reload if new files appeared."""
@@ -670,13 +779,37 @@ class LogPanel(Vertical):
         with self._lock:
             if append_only and self.lines:
                 added = new_lines[len(self.lines):]
+                added_fids = [_line_fid(l) for l in added]
+                self._line_fids.extend(added_fids)
                 self.lines = new_lines
+                all_on = len(self._level_filter) == 5
+                for line, fid in zip(added, added_fids):
+                    if all_on or fid is None or fid in self._level_filter:
+                        rl.write(colorize_line(line, self.highlights))
             else:
-                added = new_lines
+                # Full reload: pre-compute level fids once, then render.
+                self._line_fids = [_line_fid(l) for l in new_lines]
                 self.lines = new_lines
                 rl.clear()
-            for line in added:
+                self._write_filtered(rl)
+        if self._follow:
+            rl.scroll_end(animate=False)
+
+    def _write_filtered(self, rl: RichLog):
+        """Write all lines that pass the current level filter to *rl*."""
+        all_on = len(self._level_filter) == 5
+        for line, fid in zip(self.lines, self._line_fids):
+            if all_on or fid is None or fid in self._level_filter:
                 rl.write(colorize_line(line, self.highlights))
+
+    def _rerender(self):
+        """Re-render the RichLog from cached lines — no disk I/O, no extra regex."""
+        if not self.lines:
+            return
+        rl = self.query_one(f"#rl-{self.panel_id}", RichLog)
+        with self._lock:
+            rl.clear()
+            self._write_filtered(rl)
         if self._follow:
             rl.scroll_end(animate=False)
 
@@ -1038,21 +1171,41 @@ class LogViperApp(App):
                 self._watch_file(filepath)
                 if self._highlights:
                     self._panels[slot].apply_highlights(self._highlights)
-        self.push_screen(DirectoryBrowserModal(
-            on_open=on_open, default_dir=self._root_dir,
-        ))
+
+        def _worker():
+            # Open the OS-native directory picker; fall back gracefully if unavailable.
+            path = _pick_directory_native()
+            self.call_from_thread(
+                self.push_screen,
+                DirectoryBrowserModal(on_open=on_open, default_dir=path or self._root_dir),
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def action_open_file(self):
         panel_idx = self._active_panel
-        def on_select(filepath: str):
+
+        def _do_load(filepath: str):
             if panel_idx < len(self._panels):
                 self._panels[panel_idx].load_file(filepath)
                 self._watch_file(filepath)
+                self._root_dir = os.path.dirname(filepath)
                 if self._highlights:
                     self._panels[panel_idx].apply_highlights(self._highlights)
-        self.push_screen(SingleFileModal(
-            panel_idx, on_select, default_dir=self._root_dir,
-        ))
+
+        def _worker():
+            path = _pick_file_native()
+            if path and os.path.isfile(path):
+                # Native picker succeeded → load directly, no modal needed.
+                self.call_from_thread(_do_load, path)
+            else:
+                # Native picker unavailable or cancelled → fall back to text modal.
+                self.call_from_thread(
+                    self.push_screen,
+                    SingleFileModal(panel_idx, _do_load, default_dir=self._root_dir),
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def action_add_panel(self):
         self._add_panel()
