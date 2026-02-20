@@ -19,7 +19,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     Header, Footer, Static, Input, Label, ListView, ListItem,
-    Button, RichLog, SelectionList
+    Button, RichLog, SelectionList, TextArea
 )
 from textual.widgets.selection_list import Selection
 from textual.screen import ModalScreen
@@ -101,8 +101,8 @@ def _line_fid(line: str) -> Optional[str]:
             return _LEVEL_TO_FID.get(m.group(0).upper())
     return None
 
-def colorize_line(line: str, highlights: list) -> Text:
-    text = Text(line, no_wrap=True, overflow="ellipsis")
+def colorize_line(line: str, highlights: list, wrap: bool = False) -> Text:
+    text = Text(line, no_wrap=not wrap)
     for pattern, style in LEVEL_PATTERNS:
         if pattern.search(line):
             if "red" in style and "on" not in style:
@@ -231,6 +231,28 @@ def _pick_file_native() -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Write *text* to the OS clipboard. Returns True on success."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode(), check=True, timeout=5)
+            return True
+        # Linux — try common clipboard tools in order
+        for cmd in (
+            ["xclip", "-selection", "clipboard"],
+            ["xsel", "--clipboard", "--input"],
+            ["wl-copy"],                          # Wayland
+        ):
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True, timeout=5)
+                return True
+            except FileNotFoundError:
+                continue
+    except Exception:
+        pass
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -556,6 +578,77 @@ class SingleFileModal(ModalScreen):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Text view / copy modal
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TextViewModal(ModalScreen):
+    """Show panel text in a selectable TextArea so the user can copy it."""
+
+    BINDINGS = [Binding("escape,q", "dismiss", "Close")]
+
+    CSS = """
+    TextViewModal { align: center middle; }
+    #tv-dialog {
+        background: $surface;
+        border: thick $accent;
+        width: 90%;
+        height: 80%;
+        padding: 1 2;
+    }
+    #tv-title  { text-align: center; color: $accent; text-style: bold; margin-bottom: 1; }
+    #tv-area   { height: 1fr; }
+    #tv-actions { height: 3; align: right middle; margin-top: 1; }
+    """
+
+    def __init__(self, content: str, panel_name: str = ""):
+        super().__init__()
+        self._content = content
+        self._panel_name = panel_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tv-dialog"):
+            yield Label(
+                f"[bold cyan]Text View[/bold cyan]  [dim]{self._panel_name}[/dim]",
+                id="tv-title",
+            )
+            yield TextArea(self._content, read_only=True, id="tv-area")
+            with Horizontal(id="tv-actions"):
+                yield Button("Copy Selected", variant="primary", id="tv-copy-sel")
+                yield Button("Copy All", variant="success", id="tv-copy")
+                yield Button("Close  (Esc)", id="tv-close")
+
+    def on_mount(self) -> None:
+        self.query_one("#tv-area", TextArea).focus()
+
+    def _do_copy(self, text: str) -> None:
+        ok = _copy_to_clipboard(text)
+        self.query_one("#tv-title", Label).update(
+            "[bold green]✓ Copied to clipboard![/bold green]"
+            if ok
+            else "[yellow]Copy failed — clipboard tool not available[/yellow]"
+        )
+
+    @on(Button.Pressed, "#tv-copy-sel")
+    def do_copy_selected(self) -> None:
+        ta = self.query_one("#tv-area", TextArea)
+        text = ta.selected_text
+        if text:
+            self._do_copy(text)
+        else:
+            self.query_one("#tv-title", Label).update(
+                "[yellow]No text selected — drag to select, then click Copy Selected[/yellow]"
+            )
+
+    @on(Button.Pressed, "#tv-copy")
+    def do_copy(self) -> None:
+        self._do_copy(self._content)
+
+    @on(Button.Pressed, "#tv-close")
+    def do_close(self) -> None:
+        self.dismiss()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Help screen
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -597,6 +690,8 @@ class HelpScreen(ModalScreen):
 [bold yellow]Navigation & View[/bold yellow]
   S    Sync all panels to focused panel's timestamp
   F    Toggle follow / tail mode
+  W    Toggle word-wrap on active panel (also the ⏎ Wrap button in panel header)
+  T    Open visible text in selectable view (Ctrl+C / Copy All to copy)
   ?    This help screen
   Q    Quit
 
@@ -650,6 +745,11 @@ class LogPanel(Vertical):
         height: 3;
         margin: 0 0 0 1;
     }
+    .wrap-btn {
+        min-width: 7;
+        height: 3;
+        margin: 0 1 0 2;
+    }
     LogPanel > RichLog {
         height: 1fr;
         scrollbar-size: 1 1;
@@ -678,6 +778,8 @@ class LogPanel(Vertical):
         self._syncing = False  # Guard against recursive sync
         self._level_filter: set[str] = {'v', 'd', 'i', 'w', 'e'}  # all on
         self._line_fids: list[Optional[str]] = []  # pre-computed level fid per line
+        self._display_lines: list[str] = []        # lines actually rendered (post-filter)
+        self._wrap: bool = False                   # text-wrap toggle
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="panel-header", id=f"ph-{self.panel_id}"):
@@ -689,6 +791,8 @@ class LogPanel(Vertical):
             for fid, label in _FILTER_BUTTONS:
                 yield Button(label, id=f"lf-{self.panel_id}-{fid}",
                              classes="level-btn", variant="primary")
+            yield Button("⏎ Wrap", id=f"wrap-btn-{self.panel_id}",
+                         classes="wrap-btn", variant="default")
         yield Vertical(
             Label(f"[dim]Panel {self.panel_id + 1}[/dim]\n"),
             Button(
@@ -736,6 +840,18 @@ class LogPanel(Vertical):
                 btn.variant = "primary"
             # Re-render from the already-cached lines — no disk read, no extra regex.
             self._rerender()
+        elif bid == f"wrap-btn-{self.panel_id}":
+            event.stop()
+            self.toggle_wrap()
+
+    def toggle_wrap(self):
+        """Toggle line-wrapping on this panel's log view."""
+        self._wrap = not self._wrap
+        rl = self.query_one(f"#rl-{self.panel_id}", RichLog)
+        rl.wrap = self._wrap
+        btn = self.query_one(f"#wrap-btn-{self.panel_id}", Button)
+        btn.variant = "warning" if self._wrap else "default"
+        self._rerender()
 
     def load_file(self, filepath: str):
         self.filepath = filepath
@@ -785,7 +901,8 @@ class LogPanel(Vertical):
                 all_on = len(self._level_filter) == 5
                 for line, fid in zip(added, added_fids):
                     if all_on or fid is None or fid in self._level_filter:
-                        rl.write(colorize_line(line, self.highlights))
+                        self._display_lines.append(line)
+                        rl.write(colorize_line(line, self.highlights, self._wrap))
             else:
                 # Full reload: pre-compute level fids once, then render.
                 self._line_fids = [_line_fid(l) for l in new_lines]
@@ -796,11 +913,14 @@ class LogPanel(Vertical):
             rl.scroll_end(animate=False)
 
     def _write_filtered(self, rl: RichLog):
-        """Write all lines that pass the current level filter to *rl*."""
+        """Write all lines that pass the current level filter to *rl*,
+        and rebuild *_display_lines* so visible-text lookup stays correct."""
         all_on = len(self._level_filter) == 5
+        self._display_lines = []
         for line, fid in zip(self.lines, self._line_fids):
             if all_on or fid is None or fid in self._level_filter:
-                rl.write(colorize_line(line, self.highlights))
+                self._display_lines.append(line)
+                rl.write(colorize_line(line, self.highlights, self._wrap))
 
     def _rerender(self):
         """Re-render the RichLog from cached lines — no disk I/O, no extra regex."""
@@ -816,6 +936,13 @@ class LogPanel(Vertical):
     def apply_highlights(self, highlights: list):
         self.highlights = highlights
         self.reload()
+
+    def get_visible_text(self) -> str:
+        """Return the plain-text content of the currently visible rows."""
+        rl = self.query_one(f"#rl-{self.panel_id}", RichLog)
+        y = int(rl.scroll_y)
+        h = max(rl.size.height, 1)
+        return "\n".join(self._display_lines[y: y + h])
 
     def scroll_to_line(self, line_index: int):
         self.query_one(f"#rl-{self.panel_id}", RichLog).scroll_to(y=line_index, animate=False)
@@ -935,6 +1062,8 @@ class LogViperApp(App):
         Binding("n,f3",     "next_match",     "Next"),
         Binding("shift+f3", "prev_match",     "Prev"),
         Binding("escape",   "clear_search",   "Clear"),
+        Binding("t",        "view_text",      "Text View"),
+        Binding("w",        "toggle_wrap",    "Wrap"),
         Binding("?",        "show_help",      "Help"),
         Binding("q",        "quit",           "Quit"),
         Binding("plus,equal", "add_panel",    "+ Panel", show=False),
@@ -1319,6 +1448,21 @@ class LogViperApp(App):
                 panel.reload()
         self.query_one("#search-status", Label).update("")
         self.query_one("#search-input", Input).value = ""
+
+    def action_view_text(self):
+        """Open the focused panel's visible text in a selectable TextArea."""
+        panel = self.active_panel
+        if panel is None:
+            return
+        content = panel.get_visible_text()
+        name = os.path.basename(panel.filepath) if panel.filepath else f"Panel {panel.panel_id}"
+        self.push_screen(TextViewModal(content, panel_name=str(name)))
+
+    def action_toggle_wrap(self):
+        """Toggle line-wrapping on the active panel (also available via its header button)."""
+        panel = self.active_panel
+        if panel is not None:
+            panel.toggle_wrap()
 
     def action_show_help(self):
         self.push_screen(HelpScreen())
